@@ -337,6 +337,42 @@ class TestK8sBackend:
             backend.status()
         assert raised.value.code == 17
 
+    def test_wait_for_rollout_ignores_outgoing_pod_readiness(self, monkeypatch):
+        backend = K8sBackend.__new__(K8sBackend)
+        backend.namespace = "test-ns"
+        backend.context = "test-context"
+        backend.release_name = "sr"
+        base = ["kubectl", "--context", "test-context", "--namespace", "test-ns"]
+        discover = [
+            *base,
+            "get",
+            "deployments",
+            "-l",
+            "app.kubernetes.io/instance=sr",
+            "-o",
+            "name",
+        ]
+        deployments = ["deployment.apps/sr", "deployment.apps/sr-dashboard"]
+        rollout = [*base, "rollout", "status", *deployments, "--timeout=600s"]
+        calls = []
+
+        def run(command, *, check, capture_output=False):
+            assert check is False
+            calls.append(command)
+            if command == discover:
+                assert capture_output
+                return subprocess.CompletedProcess(command, 0, "\n".join(deployments))
+            # Both deployments have rolled out, but a terminating pod from
+            # the old replica set is still listed and has Ready=False.
+            return subprocess.CompletedProcess(command, 0 if command == rollout else 1)
+
+        monkeypatch.setattr(backend, "_run", run)
+        monkeypatch.setattr(backend, "_run_display", lambda _cmd: None)
+
+        backend._wait_for_pods()
+
+        assert calls == [discover, rollout]
+
     def test_wait_for_pods_failure_raises_and_prints_diagnostics(self, monkeypatch):
         backend = K8sBackend.__new__(K8sBackend)
         backend.namespace = "test-ns"
@@ -347,8 +383,10 @@ class TestK8sBackend:
         monkeypatch.setattr(
             backend,
             "_run",
-            lambda *_args, **_kwargs: subprocess.CompletedProcess(
-                args=[], returncode=1
+            lambda *_args, **kwargs: subprocess.CompletedProcess(
+                args=[],
+                returncode=0 if kwargs.get("capture_output") else 1,
+                stdout="deployment.apps/sr",
             ),
         )
         monkeypatch.setattr(backend, "_run_display", diagnostic_calls.append)
@@ -370,7 +408,7 @@ class TestK8sBackend:
             backend,
             "_run",
             lambda *_args, **_kwargs: subprocess.CompletedProcess(
-                args=[], returncode=0
+                args=[], returncode=0, stdout="deployment.apps/sr"
             ),
         )
         monkeypatch.setattr(backend, "_run_display", diagnostic_calls.append)

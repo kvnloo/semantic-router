@@ -775,27 +775,42 @@ class K8sBackend:
         return f"app.kubernetes.io/instance={self.release_name},{label}"
 
     def _wait_for_pods(self) -> None:
-        log.info("Waiting for pods to become ready ...")
-        cmd = [
-            *self._kubectl_base_cmd(),
-            "wait",
-            "--for=condition=ready",
-            "pod",
-            "-l",
-            f"app.kubernetes.io/instance={self.release_name}",
-            "--namespace",
-            self.namespace,
-            "--timeout=600s",
-        ]
+        log.info("Waiting for release deployments to roll out ...")
+        base = [*self._kubectl_base_cmd(), "--namespace", self.namespace]
+        discovery = self._run(
+            [
+                *base,
+                "get",
+                "deployments",
+                "-l",
+                self._label_for_service("all"),
+                "-o",
+                "name",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if discovery.returncode != 0:
+            log.error(discovery.stderr.strip())
+            self._log_failed_pod_diagnostics()
+            raise SystemExit(discovery.returncode)
+        deployments = discovery.stdout.split()
+        if not deployments:
+            log.error("No deployments found for Helm release %s", self.release_name)
+            self._log_failed_pod_diagnostics()
+            raise SystemExit(1)
+
+        # Follow Deployment status so terminating pods from an old ReplicaSet
+        # cannot hold the readiness check open after rollout completes.
+        cmd = [*base, "rollout", "status", *deployments, "--timeout=600s"]
         result = self._run(cmd, check=False)
         if result.returncode != 0:
-            # A failed wait means pods never became ready: reporting success
-            # here would hide broken rollouts behind a green summary.
+            # A failed rollout check must prevent the ready summary.
             self._log_failed_pod_diagnostics()
             raise SystemExit(result.returncode)
 
     def _log_failed_pod_diagnostics(self) -> None:
-        log.error("kubectl wait failed; current pod status:")
+        log.error("Deployment rollout check failed; current pod status:")
         self._run_display(
             [
                 *self._kubectl_base_cmd(),
